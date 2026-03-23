@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "yeetcode.db"
+DB_PATH = "/app/data/yeetcode.db"
 
 st.set_page_config(page_title="YeetCode DB Viewer", layout="wide")
 
