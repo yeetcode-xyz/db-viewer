@@ -99,6 +99,7 @@ else:
         st.caption(f"{len(df)} rows")
 
         df_edit = df.astype(object).where(pd.notna(df), None)
+        st.caption("Tip: clear a cell (delete its text) to set it to NULL.")
         edited = st.data_editor(
             df_edit,
             use_container_width=True,
@@ -113,55 +114,102 @@ else:
                     return None
             except (TypeError, ValueError):
                 pass
+            if isinstance(v, str) and v == "":
+                return None
             return v
 
-        if st.button("Save Changes", key=f"save_{table}"):
-            if not pk_cols:
-                st.warning("No primary key defined — cannot save changes automatically. Use Raw SQL.")
-            elif edited.shape != df_edit.shape:
-                st.error(
-                    f"Row count changed ({df_edit.shape[0]} → {edited.shape[0]}). "
-                    "Use the Add Row tab to insert; this tab only updates existing rows."
-                )
-            else:
-                changes = []
-                for idx in edited.index:
-                    row_new = edited.loc[idx]
-                    row_old = df_edit.loc[idx]
-                    diffs = {
-                        c: _norm(row_new[c])
-                        for c in edited.columns
-                        if _norm(row_new[c]) != _norm(row_old[c])
-                    }
-                    if diffs:
-                        changes.append((diffs, {c: _norm(row_new[c]) for c in pk_cols}))
+        preview_key = f"preview_{table}"
+        result_key = f"result_{table}"
 
+        col_preview, col_confirm, col_cancel = st.columns([1, 1, 4])
+
+        with col_preview:
+            if st.button("Preview Changes", key=f"prev_btn_{table}"):
+                if not pk_cols:
+                    st.session_state[preview_key] = {"error": "No primary key defined."}
+                elif edited.shape != df_edit.shape:
+                    st.session_state[preview_key] = {
+                        "error": f"Row count changed ({df_edit.shape[0]} → {edited.shape[0]}). "
+                                 "Use the Add Row tab to insert."
+                    }
+                else:
+                    changes = []
+                    for idx in edited.index:
+                        row_new = edited.loc[idx]
+                        row_old = df_edit.loc[idx]
+                        diffs = {}
+                        for c in edited.columns:
+                            new_v = _norm(row_new[c])
+                            old_v = _norm(row_old[c])
+                            if new_v != old_v:
+                                diffs[c] = (old_v, new_v)
+                        if diffs:
+                            changes.append({
+                                "pk": {c: _norm(row_new[c]) for c in pk_cols},
+                                "diffs": diffs,
+                            })
+                    st.session_state[preview_key] = {"changes": changes}
+
+        preview = st.session_state.get(preview_key)
+        if preview:
+            if "error" in preview:
+                st.error(preview["error"])
+            else:
+                changes = preview["changes"]
                 if not changes:
                     st.info("No changes detected.")
                 else:
-                    conn = get_conn()
-                    executed = []
-                    try:
-                        for diffs, pk_vals in changes:
-                            set_cols = [c for c in diffs.keys() if c not in pk_cols]
-                            if not set_cols:
-                                continue
-                            set_clause = ", ".join(f"{c} = ?" for c in set_cols)
-                            where_clause = " AND ".join(f"{c} = ?" for c in pk_cols)
-                            values = [diffs[c] for c in set_cols]
-                            pk_values = [pk_vals[c] for c in pk_cols]
-                            sql_stmt = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-                            conn.execute(sql_stmt, values + pk_values)
-                            executed.append((sql_stmt, values + pk_values))
-                        conn.commit()
-                        st.success(f"Updated {len(executed)} row(s).")
-                        with st.expander("Statements executed"):
-                            for stmt, params in executed:
-                                st.code(f"{stmt}\n-- params: {params}", language="sql")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-                    finally:
-                        conn.close()
+                    st.warning(f"{len(changes)} row(s) will be updated. Review below, then Confirm.")
+                    with st.expander(f"Show {len(changes)} pending change(s)", expanded=True):
+                        for ch in changes:
+                            pk_str = ", ".join(f"{k}={v!r}" for k, v in ch["pk"].items())
+                            st.markdown(f"**Row** `{pk_str}`")
+                            for col, (old_v, new_v) in ch["diffs"].items():
+                                st.markdown(f"- `{col}`: `{old_v!r}` → `{new_v!r}`")
+
+                    with col_confirm:
+                        if st.button("Confirm & Apply", key=f"confirm_{table}", type="primary"):
+                            conn = get_conn()
+                            executed = []
+                            try:
+                                for ch in changes:
+                                    set_cols = [c for c in ch["diffs"] if c not in pk_cols]
+                                    if not set_cols:
+                                        continue
+                                    set_clause = ", ".join(f"{c} = ?" for c in set_cols)
+                                    where_clause = " AND ".join(f"{c} = ?" for c in pk_cols)
+                                    values = [ch["diffs"][c][1] for c in set_cols]
+                                    pk_values = [ch["pk"][c] for c in pk_cols]
+                                    sql_stmt = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
+                                    conn.execute(sql_stmt, values + pk_values)
+                                    executed.append((sql_stmt, values + pk_values))
+                                conn.commit()
+                                st.session_state[result_key] = {"executed": executed}
+                            except Exception as e:
+                                st.session_state[result_key] = {"error": str(e)}
+                            finally:
+                                conn.close()
+                            st.session_state.pop(preview_key, None)
+                            st.rerun()
+
+                    with col_cancel:
+                        if st.button("Cancel", key=f"cancel_{table}"):
+                            st.session_state.pop(preview_key, None)
+                            st.rerun()
+
+        result = st.session_state.get(result_key)
+        if result:
+            if "error" in result:
+                st.error(f"Error: {result['error']}")
+            else:
+                executed = result["executed"]
+                st.success(f"Updated {len(executed)} row(s).")
+                with st.expander("Statements executed"):
+                    for stmt, params in executed:
+                        st.code(f"{stmt}\n-- params: {params}", language="sql")
+            if st.button("Dismiss", key=f"dismiss_{table}"):
+                st.session_state.pop(result_key, None)
+                st.rerun()
 
     # ── Add Row ────────────────────────────────────────────────────────────────
     with tab_add:
