@@ -1,10 +1,19 @@
+import os
 import sqlite3
 import pandas as pd
 import streamlit as st
 
-DB_PATH = "/app/data/yeetcode.db"
+DBS = {
+    "YeetCode": os.environ.get("YEETCODE_DB_PATH", "/app/data/yeetcode.db"),
+    "Companies": os.environ.get("COMPANIES_DB_PATH", "/app/data/companies.db"),
+}
 
 st.set_page_config(page_title="YeetCode DB Viewer", layout="wide")
+
+st.sidebar.title("DB Viewer")
+db_name = st.sidebar.selectbox("Database", list(DBS.keys()))
+DB_PATH = DBS[db_name]
+st.sidebar.caption(DB_PATH)
 
 
 def get_conn():
@@ -89,46 +98,70 @@ else:
         df = load_table(table, search)
         st.caption(f"{len(df)} rows")
 
+        df_edit = df.astype(object).where(pd.notna(df), None)
         edited = st.data_editor(
-            df,
-            num_rows="dynamic",
+            df_edit,
             use_container_width=True,
             key=f"editor_{table}",
         )
 
-        col_save, col_del = st.columns([1, 4])
-        with col_save:
-            if st.button("Save Changes", key=f"save_{table}"):
-                if pk_cols:
+        def _norm(v):
+            if v is None:
+                return None
+            try:
+                if pd.isna(v):
+                    return None
+            except (TypeError, ValueError):
+                pass
+            return v
+
+        if st.button("Save Changes", key=f"save_{table}"):
+            if not pk_cols:
+                st.warning("No primary key defined — cannot save changes automatically. Use Raw SQL.")
+            elif edited.shape != df_edit.shape:
+                st.error(
+                    f"Row count changed ({df_edit.shape[0]} → {edited.shape[0]}). "
+                    "Use the Add Row tab to insert; this tab only updates existing rows."
+                )
+            else:
+                changes = []
+                for idx in edited.index:
+                    row_new = edited.loc[idx]
+                    row_old = df_edit.loc[idx]
+                    diffs = {
+                        c: _norm(row_new[c])
+                        for c in edited.columns
+                        if _norm(row_new[c]) != _norm(row_old[c])
+                    }
+                    if diffs:
+                        changes.append((diffs, {c: _norm(row_new[c]) for c in pk_cols}))
+
+                if not changes:
+                    st.info("No changes detected.")
+                else:
                     conn = get_conn()
+                    executed = []
                     try:
-                        changed = edited.compare(df, result_names=("new", "orig"))
-                        if changed.empty:
-                            st.info("No changes detected.")
-                        else:
-                            changed_idx = changed.index.unique()
-                            updated = 0
-                            for idx in changed_idx:
-                                row = edited.loc[idx]
-                                set_clause = ", ".join(
-                                    [f"{c} = ?" for c in edited.columns if c not in pk_cols]
-                                )
-                                values = [row[c] for c in edited.columns if c not in pk_cols]
-                                where_clause = " AND ".join([f"{c} = ?" for c in pk_cols])
-                                pk_values = [row[c] for c in pk_cols]
-                                conn.execute(
-                                    f"UPDATE {table} SET {set_clause} WHERE {where_clause}",
-                                    values + pk_values,
-                                )
-                                updated += 1
-                            conn.commit()
-                            st.success(f"Updated {updated} row(s).")
+                        for diffs, pk_vals in changes:
+                            set_cols = [c for c in diffs.keys() if c not in pk_cols]
+                            if not set_cols:
+                                continue
+                            set_clause = ", ".join(f"{c} = ?" for c in set_cols)
+                            where_clause = " AND ".join(f"{c} = ?" for c in pk_cols)
+                            values = [diffs[c] for c in set_cols]
+                            pk_values = [pk_vals[c] for c in pk_cols]
+                            sql_stmt = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
+                            conn.execute(sql_stmt, values + pk_values)
+                            executed.append((sql_stmt, values + pk_values))
+                        conn.commit()
+                        st.success(f"Updated {len(executed)} row(s).")
+                        with st.expander("Statements executed"):
+                            for stmt, params in executed:
+                                st.code(f"{stmt}\n-- params: {params}", language="sql")
                     except Exception as e:
                         st.error(f"Error: {e}")
                     finally:
                         conn.close()
-                else:
-                    st.warning("No primary key defined — cannot save changes automatically. Use Raw SQL.")
 
     # ── Add Row ────────────────────────────────────────────────────────────────
     with tab_add:
