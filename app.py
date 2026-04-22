@@ -6,6 +6,7 @@ import streamlit as st
 DBS = {
     "YeetCode": os.environ.get("YEETCODE_DB_PATH", "/app/data/yeetcode.db"),
     "Companies": os.environ.get("COMPANIES_DB_PATH", "/app/data/companies.db"),
+    "Yeetcode Preview": os.environ.get("YEETCODE_PREVIEW_DB_PATH", "/app/data/yeetcode_preview.db"),
 }
 
 st.set_page_config(page_title="YeetCode DB Viewer", layout="wide")
@@ -98,8 +99,8 @@ else:
         df = load_table(table, search)
         st.caption(f"{len(df)} rows")
 
-        df_edit = df.astype(object).where(pd.notna(df), None)
-        st.caption("Tip: clear a cell (delete its text) to set it to NULL.")
+        df_edit = df.copy()
+        st.caption("Tip: clear a cell to set it to NULL (where the column allows it).")
         edited = st.data_editor(
             df_edit,
             use_container_width=True,
@@ -118,6 +119,52 @@ else:
                 return None
             return v
 
+        def _col_py_type(sqlite_type):
+            t = (sqlite_type or "").upper()
+            if "INT" in t or "BOOL" in t:
+                return int
+            if any(x in t for x in ("REAL", "FLOA", "DOUB", "NUM")):
+                return float
+            return str
+
+        col_py_types = {r["name"]: _col_py_type(r["type"]) for _, r in table_info.iterrows()}
+
+        def _coerce(new_v, old_v, col):
+            """Coerce new_v to the column's target Python type.
+            Returns (value, error_or_None). Target is the type of old_v when available,
+            else the column's schema-derived type."""
+            if new_v is None:
+                return None, None
+            if old_v is not None and not isinstance(old_v, str):
+                target = type(old_v)
+            else:
+                target = col_py_types.get(col, str)
+            if target is bool:
+                target = int
+            if isinstance(new_v, target) and not (target is int and isinstance(new_v, bool)):
+                return new_v, None
+            try:
+                if target is int:
+                    if isinstance(new_v, float):
+                        if not new_v.is_integer():
+                            raise ValueError(f"{new_v!r} is not an integer")
+                        return int(new_v), None
+                    if isinstance(new_v, str):
+                        s = new_v.strip()
+                        try:
+                            return int(s), None
+                        except ValueError:
+                            f = float(s)
+                            if not f.is_integer():
+                                raise ValueError(f"{s!r} is not an integer")
+                            return int(f), None
+                    return int(new_v), None
+                if target is float:
+                    return float(new_v), None
+                return str(new_v), None
+            except (ValueError, TypeError) as e:
+                return new_v, f"cannot convert {new_v!r} to {target.__name__} ({e})"
+
         preview_key = f"preview_{table}"
         result_key = f"result_{table}"
 
@@ -134,31 +181,47 @@ else:
                     }
                 else:
                     changes = []
+                    errors = []
                     for idx in edited.index:
                         row_new = edited.loc[idx]
                         row_old = df_edit.loc[idx]
+                        pk_vals = {c: _norm(row_new[c]) for c in pk_cols}
+                        pk_desc = ", ".join(f"{k}={v!r}" for k, v in pk_vals.items())
                         diffs = {}
                         for c in edited.columns:
-                            new_v = _norm(row_new[c])
                             old_v = _norm(row_old[c])
+                            raw_new = _norm(row_new[c])
+                            new_v, err = _coerce(raw_new, old_v, c)
+                            if err:
+                                errors.append(f"Row `{pk_desc}`, col `{c}`: {err}")
+                                continue
                             if new_v != old_v:
                                 diffs[c] = (old_v, new_v)
                         if diffs:
-                            changes.append({
-                                "pk": {c: _norm(row_new[c]) for c in pk_cols},
-                                "diffs": diffs,
-                            })
-                    st.session_state[preview_key] = {"changes": changes}
+                            changes.append({"pk": pk_vals, "diffs": diffs})
+                    st.session_state[preview_key] = {"changes": changes, "errors": errors}
 
         preview = st.session_state.get(preview_key)
         if preview:
+            show_confirm = False
             if "error" in preview:
                 st.error(preview["error"])
             else:
-                changes = preview["changes"]
-                if not changes:
+                changes = preview.get("changes", [])
+                errors = preview.get("errors", [])
+
+                if errors:
+                    st.error(
+                        f"{len(errors)} type-coercion error(s) — fix the cell(s) in the editor, then Preview again. "
+                        "Confirm is disabled while errors exist."
+                    )
+                    with st.expander(f"Show {len(errors)} error(s)", expanded=True):
+                        for e in errors:
+                            st.markdown(f"- {e}")
+
+                if not changes and not errors:
                     st.info("No changes detected.")
-                else:
+                elif changes:
                     st.warning(f"{len(changes)} row(s) will be updated. Review below, then Confirm.")
                     with st.expander(f"Show {len(changes)} pending change(s)", expanded=True):
                         for ch in changes:
@@ -166,36 +229,42 @@ else:
                             st.markdown(f"**Row** `{pk_str}`")
                             for col, (old_v, new_v) in ch["diffs"].items():
                                 st.markdown(f"- `{col}`: `{old_v!r}` → `{new_v!r}`")
+                    show_confirm = not errors
 
-                    with col_confirm:
-                        if st.button("Confirm & Apply", key=f"confirm_{table}", type="primary"):
-                            conn = get_conn()
-                            executed = []
+            if show_confirm:
+                with col_confirm:
+                    if st.button("Confirm & Apply", key=f"confirm_{table}", type="primary"):
+                        conn = get_conn()
+                        executed = []
+                        try:
+                            for ch in preview["changes"]:
+                                set_cols = [c for c in ch["diffs"] if c not in pk_cols]
+                                if not set_cols:
+                                    continue
+                                set_clause = ", ".join(f"{c} = ?" for c in set_cols)
+                                where_clause = " AND ".join(f"{c} = ?" for c in pk_cols)
+                                values = [ch["diffs"][c][1] for c in set_cols]
+                                pk_values = [ch["pk"][c] for c in pk_cols]
+                                sql_stmt = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
+                                conn.execute(sql_stmt, values + pk_values)
+                                executed.append((sql_stmt, values + pk_values))
+                            conn.commit()
+                            st.session_state[result_key] = {"executed": executed}
+                        except Exception as e:
                             try:
-                                for ch in changes:
-                                    set_cols = [c for c in ch["diffs"] if c not in pk_cols]
-                                    if not set_cols:
-                                        continue
-                                    set_clause = ", ".join(f"{c} = ?" for c in set_cols)
-                                    where_clause = " AND ".join(f"{c} = ?" for c in pk_cols)
-                                    values = [ch["diffs"][c][1] for c in set_cols]
-                                    pk_values = [ch["pk"][c] for c in pk_cols]
-                                    sql_stmt = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
-                                    conn.execute(sql_stmt, values + pk_values)
-                                    executed.append((sql_stmt, values + pk_values))
-                                conn.commit()
-                                st.session_state[result_key] = {"executed": executed}
-                            except Exception as e:
-                                st.session_state[result_key] = {"error": str(e)}
-                            finally:
-                                conn.close()
-                            st.session_state.pop(preview_key, None)
-                            st.rerun()
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            st.session_state[result_key] = {"error": str(e)}
+                        finally:
+                            conn.close()
+                        st.session_state.pop(preview_key, None)
+                        st.rerun()
 
-                    with col_cancel:
-                        if st.button("Cancel", key=f"cancel_{table}"):
-                            st.session_state.pop(preview_key, None)
-                            st.rerun()
+            with col_cancel:
+                if st.button("Cancel", key=f"cancel_{table}"):
+                    st.session_state.pop(preview_key, None)
+                    st.rerun()
 
         result = st.session_state.get(result_key)
         if result:
