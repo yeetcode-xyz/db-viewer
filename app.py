@@ -3,10 +3,15 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 DBS = {
-    "YeetCode": os.environ.get("YEETCODE_DB_PATH", "/app/data/yeetcode.db"),
-    "Companies": os.environ.get("COMPANIES_DB_PATH", "/app/data/companies.db"),
-    "Yeetcode Preview": os.environ.get("YEETCODE_PREVIEW_DB_PATH", "/app/data/yeetcode_preview.db"),
+    "YeetCode": os.environ.get("YEETCODE_DB_PATH", os.path.join(HERE, "yeetcode.db")),
+    "Companies": os.environ.get(
+        "COMPANIES_DB_PATH", os.path.join(HERE, "..", "yeetcode-api", "companies.db")
+    ),
+    "Yeetcode Preview": os.environ.get(
+        "YEETCODE_PREVIEW_DB_PATH", os.path.join(HERE, "yeetcode_preview.db")
+    ),
 }
 
 st.set_page_config(page_title="YeetCode DB Viewer", layout="wide")
@@ -61,26 +66,81 @@ page = st.sidebar.radio("Page", ["Dashboard"] + tables)
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 if page == "Dashboard":
-    st.title("Dashboard")
+    st.title(f"Dashboard — {db_name}")
+    if not os.path.isfile(DB_PATH):
+        st.error(f"Database file not found: {DB_PATH}")
+        st.stop()
+
     conn = get_conn()
+    table_set = set(tables)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Users", pd.read_sql_query("SELECT COUNT(*) FROM users", conn).iloc[0, 0])
-    col2.metric("Daily Problems", pd.read_sql_query("SELECT COUNT(*) FROM daily_problems", conn).iloc[0, 0])
-    col3.metric("Bounties", pd.read_sql_query("SELECT COUNT(*) FROM bounties", conn).iloc[0, 0])
-    col4.metric("Bounty Progress Entries", pd.read_sql_query("SELECT COUNT(*) FROM bounty_progress", conn).iloc[0, 0])
+    # Row-count metric per table, four per row.
+    if tables:
+        st.subheader("Row counts")
+        for i in range(0, len(tables), 4):
+            row = tables[i : i + 4]
+            cols = st.columns(len(row))
+            for col, t in zip(cols, row):
+                try:
+                    n = pd.read_sql_query(f"SELECT COUNT(*) FROM {t}", conn).iloc[0, 0]
+                    col.metric(t, f"{n:,}")
+                except Exception as e:
+                    col.metric(t, "—")
+                    col.caption(f"err: {e}")
+    else:
+        st.info("No tables in this database.")
 
-    st.subheader("Top 10 Users by XP")
-    top_users = pd.read_sql_query(
-        "SELECT username, xp FROM users ORDER BY xp DESC LIMIT 10", conn
-    ).set_index("username")
-    st.bar_chart(top_users)
+    # YeetCode-style charts (only when the relevant tables exist).
+    if {"users"}.issubset(table_set):
+        st.subheader("Top 10 Users by XP")
+        try:
+            top_users = pd.read_sql_query(
+                "SELECT username, xp FROM users ORDER BY xp DESC LIMIT 10", conn
+            ).set_index("username")
+            st.bar_chart(top_users)
+        except Exception as e:
+            st.caption(f"(skipped: {e})")
 
-    st.subheader("Difficulty Breakdown (Daily Problems)")
-    diff = pd.read_sql_query(
-        "SELECT difficulty, COUNT(*) as count FROM daily_problems GROUP BY difficulty", conn
-    ).set_index("difficulty")
-    st.bar_chart(diff)
+    if {"daily_problems"}.issubset(table_set):
+        st.subheader("Difficulty Breakdown (Daily Problems)")
+        try:
+            diff = pd.read_sql_query(
+                "SELECT difficulty, COUNT(*) as count FROM daily_problems GROUP BY difficulty",
+                conn,
+            ).set_index("difficulty")
+            st.bar_chart(diff)
+        except Exception as e:
+            st.caption(f"(skipped: {e})")
+
+    # Companies-DB charts.
+    if {"company_problems"}.issubset(table_set):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Top 15 Companies by Problem Count")
+            top_co = pd.read_sql_query(
+                "SELECT company_id, COUNT(*) AS problems "
+                "FROM company_problems GROUP BY company_id "
+                "ORDER BY problems DESC LIMIT 15",
+                conn,
+            ).set_index("company_id")
+            st.bar_chart(top_co)
+        with c2:
+            st.subheader("Difficulty Breakdown")
+            diff = pd.read_sql_query(
+                "SELECT COALESCE(difficulty, '(null)') AS difficulty, COUNT(*) AS count "
+                "FROM company_problems GROUP BY difficulty ORDER BY count DESC",
+                conn,
+            ).set_index("difficulty")
+            st.bar_chart(diff)
+
+        st.subheader("Top 20 Most-Asked Problems")
+        popular = pd.read_sql_query(
+            "SELECT problem_id, title, difficulty, COUNT(*) AS companies "
+            "FROM company_problems GROUP BY problem_id, title, difficulty "
+            "ORDER BY companies DESC, problem_id ASC LIMIT 20",
+            conn,
+        )
+        st.dataframe(popular, use_container_width=True)
 
     conn.close()
 
