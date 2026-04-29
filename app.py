@@ -1,24 +1,141 @@
 import os
 import sqlite3
+import tempfile
 import pandas as pd
 import streamlit as st
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DBS = {
-    "YeetCode": os.environ.get("YEETCODE_DB_PATH", os.path.join(HERE, "yeetcode.db")),
-    "Companies": os.environ.get(
-        "COMPANIES_DB_PATH", os.path.join(HERE, "..", "yeetcode-api", "companies.db")
-    ),
-    "Yeetcode Preview": os.environ.get(
-        "YEETCODE_PREVIEW_DB_PATH", os.path.join(HERE, "yeetcode_preview.db")
-    ),
-}
-
 st.set_page_config(page_title="YeetCode DB Viewer", layout="wide")
 
+# Where uploaded DBs get persisted across reruns (a Streamlit rerun re-executes
+# the script top-to-bottom, so we keep uploads on disk and remember the path
+# in session_state).
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "db-viewer-uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def discover_dbs():
+    """Find candidate .db files in commonly-mounted locations.
+
+    Returns a list of (label, absolute_path) — labels are de-duplicated.
+    Searches: env-var presets, /app, /app/data, /data, the repo root if
+    mounted at /workspace, and the directory of this script.
+    """
+    candidates = []
+
+    env_presets = [
+        ("YeetCode", os.environ.get("YEETCODE_DB_PATH")),
+        ("Companies", os.environ.get("COMPANIES_DB_PATH")),
+        ("Yeetcode Preview", os.environ.get("YEETCODE_PREVIEW_DB_PATH")),
+    ]
+    for label, p in env_presets:
+        if p and os.path.isfile(p):
+            candidates.append((label, os.path.abspath(p)))
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [
+        here,
+        "/app",
+        "/app/data",
+        "/data",
+        "/workspace",
+        "/workspace/db-viewer",
+        "/workspace/yeetcode-api",
+        os.path.join(here, "..", "yeetcode-api"),
+    ]
+    seen = {p for _, p in candidates}
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for name in entries:
+            if not name.endswith(".db"):
+                continue
+            full = os.path.abspath(os.path.join(d, name))
+            if full in seen:
+                continue
+            try:
+                if os.path.getsize(full) == 0:
+                    continue  # skip obviously-empty placeholders
+            except OSError:
+                continue
+            seen.add(full)
+            candidates.append((name, full))
+    return candidates
+
+
+# ── Sidebar: pick a database ──────────────────────────────────────────────────
 st.sidebar.title("DB Viewer")
-db_name = st.sidebar.selectbox("Database", list(DBS.keys()))
-DB_PATH = DBS[db_name]
+
+mode = st.sidebar.radio(
+    "Source",
+    ["Discovered", "Custom path", "Upload"],
+    key="db_source",
+    help="Discovered: .db files found on disk.  "
+    "Custom path: type any absolute path the container can read.  "
+    "Upload: send a .db from your machine.",
+)
+
+DB_PATH = None
+db_name = None
+
+if mode == "Discovered":
+    found = discover_dbs()
+    if not found:
+        st.sidebar.warning(
+            "No .db files found. Use Upload, or mount your DB into the container."
+        )
+    else:
+        labels = [f"{lbl} — {p}" for lbl, p in found]
+        idx = st.sidebar.selectbox(
+            "Database",
+            range(len(labels)),
+            format_func=lambda i: labels[i],
+            key="discovered_idx",
+        )
+        db_name, DB_PATH = found[idx]
+
+elif mode == "Custom path":
+    DB_PATH = st.sidebar.text_input(
+        "Absolute path to .db file",
+        value=st.session_state.get("custom_db_path", ""),
+        key="custom_db_path",
+        placeholder="/app/data/companies.db",
+    ).strip() or None
+    if DB_PATH:
+        db_name = os.path.basename(DB_PATH)
+        if not os.path.isfile(DB_PATH):
+            st.sidebar.error("File not found at that path.")
+
+elif mode == "Upload":
+    uploaded = st.sidebar.file_uploader(
+        "Upload a .db file",
+        type=["db", "sqlite", "sqlite3"],
+        key="db_uploader",
+    )
+    if uploaded is not None:
+        target = os.path.join(UPLOAD_DIR, uploaded.name)
+        with open(target, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.session_state["uploaded_db_path"] = target
+        st.session_state["uploaded_db_name"] = uploaded.name
+    if "uploaded_db_path" in st.session_state:
+        DB_PATH = st.session_state["uploaded_db_path"]
+        db_name = st.session_state["uploaded_db_name"]
+        st.sidebar.success(f"Using uploaded: {db_name}")
+
+if not DB_PATH or not os.path.isfile(DB_PATH):
+    st.title("YeetCode DB Viewer")
+    st.info(
+        "Pick a database in the sidebar to get started. "
+        "The bundled image doesn't ship with your data — use **Upload** to send "
+        "a `.db` from your machine, or mount one in and use **Discovered** / "
+        "**Custom path**."
+    )
+    st.stop()
+
 st.sidebar.caption(DB_PATH)
 
 
@@ -59,18 +176,14 @@ def get_pk_cols(table_info):
     return table_info[table_info["pk"] > 0]["name"].tolist()
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-st.sidebar.title("YeetCode DB")
+# ── Sidebar: pages ────────────────────────────────────────────────────────────
+st.sidebar.markdown("---")
 tables = get_tables()
 page = st.sidebar.radio("Page", ["Dashboard"] + tables)
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 if page == "Dashboard":
     st.title(f"Dashboard — {db_name}")
-    if not os.path.isfile(DB_PATH):
-        st.error(f"Database file not found: {DB_PATH}")
-        st.stop()
-
     conn = get_conn()
     table_set = set(tables)
 
