@@ -179,7 +179,13 @@ def get_pk_cols(table_info):
 # ── Sidebar: pages ────────────────────────────────────────────────────────────
 st.sidebar.markdown("---")
 tables = get_tables()
-page = st.sidebar.radio("Page", ["Dashboard"] + tables)
+_table_set = set(tables)
+_admin_pages = (
+    ["Plus Users"]
+    if {"users", "promo_redemptions"}.issubset(_table_set)
+    else []
+)
+page = st.sidebar.radio("Page", ["Dashboard"] + _admin_pages + tables)
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 if page == "Dashboard":
@@ -256,6 +262,99 @@ if page == "Dashboard":
         st.dataframe(popular, use_container_width=True)
 
     conn.close()
+
+# ── Plus Users ─────────────────────────────────────────────────────────────────
+elif page == "Plus Users":
+    st.title("Plus Users — Admin")
+
+    # Show result from a previous downgrade action (popped so it only shows once).
+    _dg_result = st.session_state.pop("plus_downgrade_result", None)
+    if _dg_result:
+        if "error" in _dg_result:
+            st.error(f"Error: {_dg_result['error']}")
+        else:
+            st.success(f"Downgraded @{_dg_result['username']} to free tier.")
+
+    # ── Active Plus Users table ────────────────────────────────────────────────
+    st.subheader("Active Plus Users")
+    try:
+        conn = get_conn()
+        df_plus = pd.read_sql_query(
+            """
+            SELECT u.username, u.email, u.tier,
+                   u.stripe_customer_id, u.stripe_subscription_id,
+                   u.subscription_status,
+                   pr.code AS promo_code, pr.redeemed_at
+            FROM users u
+            LEFT JOIN promo_redemptions pr ON pr.username = u.username
+            WHERE u.tier = 'plus'
+            ORDER BY u.username
+            """,
+            conn,
+        )
+        conn.close()
+        df_plus["source"] = df_plus["promo_code"].apply(
+            lambda x: "promo" if pd.notna(x) and x else "stripe"
+        )
+        st.caption(f"{len(df_plus)} plus user(s)")
+        st.dataframe(df_plus, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not load Plus users: {e}")
+
+    st.markdown("---")
+
+    # ── Downgrade ──────────────────────────────────────────────────────────────
+    st.subheader("Downgrade User to Free")
+
+    st.info(
+        "This only clears the DB record — it does NOT cancel any active Stripe "
+        "subscription. If this user has a Stripe subscription, cancel it in the "
+        "Stripe dashboard separately."
+    )
+
+    username_input = st.text_input(
+        "Username", placeholder="e.g. kshitijndev", key="downgrade_username"
+    ).strip()
+
+    if username_input:
+        st.warning(
+            f"This will set **{username_input}** to `tier = 'free'` and clear "
+            "`stripe_customer_id`, `stripe_subscription_id`, `subscription_status`, "
+            "and `subscription_current_period_end`."
+        )
+        confirmed = st.checkbox(
+            "I understand — proceed with downgrade", key="downgrade_confirm"
+        )
+        if st.button("Downgrade to Free", type="primary", disabled=not confirmed):
+            conn = get_conn()
+            try:
+                cur = conn.execute(
+                    """UPDATE users
+                          SET tier                            = 'free',
+                              stripe_customer_id             = NULL,
+                              stripe_subscription_id         = NULL,
+                              subscription_status            = NULL,
+                              subscription_current_period_end = NULL
+                        WHERE username = ?""",
+                    (username_input,),
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    st.session_state["plus_downgrade_result"] = {
+                        "error": f"No user found with username '{username_input}'."
+                    }
+                else:
+                    conn.commit()
+                    st.session_state["plus_downgrade_result"] = {"username": username_input}
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                st.session_state["plus_downgrade_result"] = {"error": str(e)}
+            finally:
+                conn.close()
+            st.rerun()
 
 # ── Table Pages ────────────────────────────────────────────────────────────────
 else:
